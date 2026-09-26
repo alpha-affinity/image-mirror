@@ -10,19 +10,16 @@ name: Mirror third-party images
 # SAME digest as the source. A single-source copy preserves the image config,
 # so its build date (and any age gate keyed on it) is unchanged.
 #
-# Licence compliance: before copying, the workflow checks that the entry's
-# `source_repo` (our fork) carries the release tag at the commit the image was
-# built from, so every binary served here has its Corresponding Source held by
-# us. On a version bump, pin the new release in the fork first (forks share
-# objects with upstream, so the commit resolves; the ref is what keeps it):
-#   gh api -X POST repos/<source_repo>/git/refs \
-#     -f ref=refs/tags/<tag> -f sha=<image revision label>
-# The gate's error message prints this command with the values filled in.
+# Licence compliance: before copying, the workflow archives the Corresponding
+# Source for the exact commit the image was built from (its
+# org.opencontainers.image.revision label) as an asset on a release of THIS
+# repository, `<name>-<tag>`, and refuses to publish the image without it. Once
+# archived, the source no longer depends on the upstream repo existing. No
+# manual step on a bump: a new tag gets its own release on the next run.
 #
-# The packages are connected to this repository, which is why it is public
-# and holds nothing but this workflow and a README. A new package is created
-# private on its first push; set it to Public once (Package settings → Danger
-# Zone). The last step fails until that is done.
+# The packages are connected to this repository, which is why it is public and
+# holds nothing but this workflow and a README. Packages created from a public
+# repository start public; the last step fails if one ever is not.
 on:
   push:
     branches: [main]
@@ -32,7 +29,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write  # source-archive releases
   packages: write
 
 concurrency:
@@ -48,20 +45,19 @@ jobs:
       matrix:
         image:
         # pgsty/silo — maintained AGPL-3.0 fork of MinIO community edition.
-        # Unmodified; upstream: https://github.com/pgsty/silo
-        # source_repo is OUR fork holding the Corresponding Source (AGPL §6).
-        # `tag` doubles as the git tag that must exist there.
+        # Unmodified. source_repo is the upstream GitHub repo the revision label
+        # refers to; its tarball at that commit is archived here.
         - name: silo
           source: docker.io/pgsty/silo
           tag: RELEASE.2026-09-16T00-00-00Z
           digest: sha256:635197cb9f36d01bee221d34d1c7d7960f6a95c48b0b6c01d99cd13bdae51a46
-          source_repo: alpha-affinity/silo
+          source_repo: pgsty/silo
     env:
       SOURCE: ${{ matrix.image.source }}@${{ matrix.image.digest }}
       TARGET: ghcr.io/alpha-affinity/mirror/${{ matrix.image.name }}:${{ matrix.image.tag }}
       DIGEST: ${{ matrix.image.digest }}
       SOURCE_REPO: ${{ matrix.image.source_repo }}
-      TAG: ${{ matrix.image.tag }}
+      RELEASE: ${{ matrix.image.name }}-${{ matrix.image.tag }}
     steps:
     - uses: docker/setup-buildx-action@v4.2.0
     - uses: docker/login-action@v4.4.0
@@ -70,36 +66,47 @@ jobs:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     # Never publish an AGPL binary whose Corresponding Source we do not hold.
-    # The image's revision label names the exact commit; our fork must carry
-    # the release tag at that commit. Checked by REF, not by commit lookup:
-    # forks share an object store with upstream, so a bare commit lookup
-    # succeeds even when only upstream has it — a ref in our fork is what
-    # keeps it alive if upstream disappears.
-    - name: Verify ${{ env.SOURCE_REPO }} holds the Corresponding Source
+    # Idempotent: an existing archive for this exact revision is reused, so
+    # once archived nothing here needs the upstream repo again.
+    - name: Archive the Corresponding Source as release ${{ env.RELEASE }}
       env:
         GH_TOKEN: ${{ github.token }}
+        GH_REPO: ${{ github.repository }}
       run: |
         set -euo pipefail
-        revs="$(docker buildx imagetools inspect "$SOURCE" --format '{{json .Image}}' \
+        rev="$(docker buildx imagetools inspect "$SOURCE" --format '{{json .Image}}' \
           | jq -r '[.. | objects | select(has("Labels")) | .Labels["org.opencontainers.image.revision"] // empty] | unique | .[]')"
-        if [ "$(printf '%s\n' "$revs" | grep -c .)" -ne 1 ]; then
-          echo "::error::expected exactly one org.opencontainers.image.revision across platforms, got: ${revs:-none}"
+        if [ "$(printf '%s\n' "$rev" | grep -c .)" -ne 1 ]; then
+          echo "::error::expected exactly one org.opencontainers.image.revision across platforms, got: ${rev:-none}"
           exit 1
         fi
-        remedy="pin it: \`gh api -X POST repos/$SOURCE_REPO/git/refs -f ref=refs/tags/$TAG -f sha=$revs\`, then re-run"
-        if ! ref="$(gh api "repos/$SOURCE_REPO/git/ref/tags/$TAG" --jq '.object.type + " " + .object.sha')"; then
-          echo "::error::$SOURCE_REPO has no tag $TAG — $remedy"
-          exit 1
+        asset="${SOURCE_REPO//\//-}-$rev.tar.gz"
+        # grep without -q, sed not head: an early-exiting reader SIGPIPEs the
+        # writer, which pipefail would turn into a false failure.
+        if gh release view "$RELEASE" --json assets --jq '.assets[].name' 2>/dev/null | grep -xF "$asset" >/dev/null; then
+          echo "Corresponding Source already archived: $asset"
+        else
+          curl -fsSL --retry 3 -o "$asset" "https://codeload.github.com/$SOURCE_REPO/tar.gz/$rev"
+          # GitHub names the tarball's top-level directory <repo>-<full sha>.
+          top="$(tar -tzf "$asset" | sed -n 1p)"
+          case "$top" in
+            *-"$rev"/) ;;
+            *) echo "::error::archive top-level entry '$top' does not name revision $rev"; exit 1 ;;
+          esac
+          sum="$(sha256sum "$asset" | cut -d' ' -f1)"
+          notes="Corresponding Source for ghcr.io/alpha-affinity/mirror image $RELEASE (unmodified).
+        Upstream: https://github.com/$SOURCE_REPO at commit $rev.
+        Image: $SOURCE
+        sha256($asset) = $sum"
+          if gh release view "$RELEASE" >/dev/null 2>&1; then
+            gh release upload "$RELEASE" "$asset"
+          else
+            gh release create "$RELEASE" "$asset" --target main --latest=false \
+              --title "$RELEASE source" --notes "$notes"
+          fi
+          echo "Archived Corresponding Source: $asset ($sum)"
         fi
-        read -r type sha <<<"$ref"
-        if [ "$type" = tag ]; then
-          sha="$(gh api "repos/$SOURCE_REPO/git/tags/$sha" --jq .object.sha)"
-        fi
-        if [ "$sha" != "$revs" ]; then
-          echo "::error::$SOURCE_REPO tag $TAG is $sha but the image was built from $revs — $remedy"
-          exit 1
-        fi
-        echo "Corresponding Source: https://github.com/$SOURCE_REPO/tree/$revs"
+        echo "Release: https://github.com/$GH_REPO/releases/tag/$RELEASE"
     # A single-source `imagetools create` copies the index and every child
     # manifest (platforms and attestations) unchanged. Idempotent.
     - name: Copy ${{ matrix.image.name }} into ghcr
