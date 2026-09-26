@@ -4,9 +4,16 @@ Unmodified, digest-identical copies of third-party container images, served from
 `ghcr.io/alpha-affinity/mirror/*` so an upstream takedown cannot break the
 consumers that pin them. The list lives in `.github/workflows/mirror.yml`.
 
-| Image | Source | License |
-| --- | --- | --- |
-| `mirror/silo` | [pgsty/silo](https://github.com/pgsty/silo) | AGPL-3.0 |
+| Image | Version | License | Corresponding Source | Upstream |
+| --- | --- | --- | --- | --- |
+| `mirror/silo` | `RELEASE.2026-09-16T00-00-00Z` | AGPL-3.0-or-later | [alpha-affinity/silo @ `2a4d514`](https://github.com/alpha-affinity/silo/tree/2a4d51406b7ed87af5fe6fe0f801f3290f96eb3c) (tag [`RELEASE.2026-09-16T00-00-00Z`](https://github.com/alpha-affinity/silo/releases/tag/RELEASE.2026-09-16T00-00-00Z)) | [pgsty/silo](https://github.com/pgsty/silo) |
 
-Each image is redistributed unmodified under its own license; see the source
-project for the corresponding source code.
+Each image is redistributed unmodified under its own license. The Corresponding
+Source for every image we serve is held in a fork under this organization, at the
+exact commit recorded in the image's `org.opencontainers.image.revision` label,
+so it stays available even if the upstream project goes away. The mirror workflow
+refuses to publish an image whose source revision is missing from that fork.
+
+The silo image is built on Red Hat UBI, redistributed under the
+[UBI EULA](https://www.redhat.com/en/about/red-hat-end-user-license-agreements#UBI).
+License texts for the bundled components ship inside the image under `/licenses/`.
